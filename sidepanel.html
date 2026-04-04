@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IntraClick Sentinel</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <main class="panel">
+    <header>
+      <h1>IntraClick Sentinel</h1>
+      <p>Internal click capture to Word report</p>
+    </header>
+
+    <section class="warning" id="warningBox">
+      <strong>Internal Use Only:</strong> This tool captures click events and screenshots on the active tab where you start recording.
+    </section>
+
+    <section class="session-meta">
+      <button id="toggleSessionBtn" class="section-toggle" type="button" aria-expanded="false">Session Details</button>
+      <div id="sessionMetaBody" class="meta-grid hidden">
+        <label>
+          <span>Tester</span>
+          <input id="testerInput" type="text" maxlength="120" placeholder="Your name" />
+        </label>
+        <label>
+          <span>Module</span>
+          <input id="moduleInput" type="text" maxlength="120" placeholder="Feature/module" />
+        </label>
+        <label>
+          <span>Ticket ID</span>
+          <input id="ticketInput" type="text" maxlength="120" placeholder="JIRA/Task ID" />
+        </label>
+        <label>
+          <span>Environment</span>
+          <input id="envInput" type="text" maxlength="120" placeholder="UAT/Prod/SIT" />
+        </label>
+        <label>
+          <span>Build Version</span>
+          <input id="buildInput" type="text" maxlength="120" placeholder="App build/version" />
+        </label>
+      </div>
+    </section>
+
+    <section class="controls">
+      <button id="startBtn" class="primary">Start</button>
+      <button id="pauseBtn" class="secondary" disabled>Pause</button>
+      <button id="stopBtn" class="warn" disabled>Stop</button>
+      <button id="exportBtn" disabled>Export Word</button>
+      <button id="clearBtn">Clear All</button>
+      <button id="closeBtn" class="ghost">Close Panel</button>
+      <button id="previousBtn" class="ghost wide" disabled>Previous SS</button>
+    </section>
+
+    <section class="status">
+      <span id="statusText">Idle</span>
+      <span id="countText">0 screenshots</span>
+    </section>
+    <section class="timer-row">
+      <span id="timerLabel">Export Timer (Reverse)</span>
+      <span id="timerText">--:--</span>
+    </section>
+
+    <section>
+      <div id="errorBox" class="error hidden"></div>
+      <div id="gallery" class="gallery"></div>
+    </section>
+  </main>
+
+  <div id="historyModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Previous screenshots">
+    <div class="modal-content">
+      <div class="modal-head">
+        <h2>Previous Screenshots</h2>
+        <button id="modalCloseBtn" class="ghost" type="button">Close</button>
+      </div>
+      <div id="historyGrid" class="history-grid"></div>
+    </div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

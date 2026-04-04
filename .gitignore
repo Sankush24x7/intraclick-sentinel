@@ -1,0 +1,34 @@
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor/IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime/temp
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Build/package artifacts
+dist/
+build/
+release/
+*.zip
+
+# Dependencies (if added later)
+node_modules/
