@@ -3,6 +3,7 @@ const ui = {
   pause: document.getElementById('pauseBtn'),
   stop: document.getElementById('stopBtn'),
   exportBtn: document.getElementById('exportBtn'),
+  exportPdfBtn: document.getElementById('exportPdfBtn'),
   clearBtn: document.getElementById('clearBtn'),
   closeBtn: document.getElementById('closeBtn'),
   previousBtn: document.getElementById('previousBtn'),
@@ -61,6 +62,7 @@ function renderControls() {
   ui.pause.disabled = !state.recording;
   ui.stop.disabled = !state.recording;
   ui.exportBtn.disabled = state.captures.length === 0;
+  ui.exportPdfBtn.disabled = state.captures.length === 0;
   ui.clearBtn.disabled = state.captures.length === 0;
   ui.previousBtn.disabled = state.captures.length === 0;
 
@@ -386,12 +388,20 @@ async function stopRecording() {
 }
 
 async function exportWord() {
+  await exportReport('panel:exportWord', 'Word export failed.');
+}
+
+async function exportPdf() {
+  await exportReport('panel:exportPdf', 'PDF export failed.');
+}
+
+async function exportReport(messageType, errorText) {
   showError('');
   await saveMetadata().catch(() => null);
 
   const tab = await currentTab();
   const res = await chrome.runtime.sendMessage({
-    type: 'panel:exportWord',
+    type: messageType,
     tabId: state.tabId,
     pageUrl: tab?.url || '',
     startedAt: state.startedAt || Date.now(),
@@ -400,7 +410,7 @@ async function exportWord() {
   });
 
   if (!res?.ok) {
-    showError(res?.error || 'Word export failed.');
+    showError(res?.error || errorText);
     return;
   }
 
@@ -516,6 +526,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   ui.pause.addEventListener('click', pauseResumeRecording);
   ui.stop.addEventListener('click', stopRecording);
   ui.exportBtn.addEventListener('click', exportWord);
+  ui.exportPdfBtn.addEventListener('click', exportPdf);
   ui.clearBtn.addEventListener('click', clearCaptures);
   ui.closeBtn.addEventListener('click', closePanel);
   ui.previousBtn.addEventListener('click', openHistoryModal);

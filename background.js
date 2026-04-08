@@ -69,6 +69,20 @@ function escapeHtml(text) {
     .replace(/'/g, '&#039;');
 }
 
+function escapePdfText(text) {
+  return String(text || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(/[\r\n]+/g, ' ');
+}
+
+function truncateText(text, max = 180) {
+  const value = String(text || '').trim();
+  if (value.length <= max) return value;
+  return `${value.slice(0, max - 3)}...`;
+}
+
 async function notifyPanel(payload) {
   try {
     await chrome.runtime.sendMessage(payload);
@@ -110,14 +124,17 @@ function buildDocHtml(report) {
 
   const itemsHtml = report.captures.map((c, i) => {
     return `
-      <h3>Step ${i + 1}</h3>
-      <p><b>Time:</b> ${escapeHtml(new Date(c.ts).toLocaleString())}</p>
-      <p><b>Click Area:</b> ${escapeHtml(c.area || '-')}</p>
-      <p><b>Tag:</b> ${escapeHtml(c.tag || '-')}</p>
-      <p><b>URL:</b> ${escapeHtml(c.url)}</p>
-      <p><b>Note:</b> ${escapeHtml(c.note || '-')}</p>
-      <img src="${c.imageDataUrl}" style="max-width:100%;border:1px solid #ccc;" />
-      <hr/>
+      <section class="capture-step">
+        <h3>Step ${i + 1}</h3>
+        <p><b>Time:</b> ${escapeHtml(new Date(c.ts).toLocaleString())}</p>
+        <p><b>Click Area:</b> ${escapeHtml(c.area || '-')}</p>
+        <p><b>Tag:</b> ${escapeHtml(c.tag || '-')}</p>
+        <p><b>URL:</b> ${escapeHtml(c.url)}</p>
+        <p><b>Note:</b> ${escapeHtml(c.note || '-')}</p>
+        <div class="capture-frame">
+          <img class="capture-img" src="${c.imageDataUrl}" />
+        </div>
+      </section>
     `;
   }).join('\n');
 
@@ -127,11 +144,31 @@ function buildDocHtml(report) {
       <meta charset="utf-8" />
       <title>ClickSnap Report</title>
       <style>
-        body { font-family: Calibri, Arial, sans-serif; padding: 20px; }
+        @page { size: 11in 8.5in; margin: 0.5in; }
+        body { font-family: Calibri, Arial, sans-serif; padding: 0; margin: 0; }
         h1 { color: #0f172a; }
         h3 { margin-bottom: 4px; }
         p { margin: 2px 0; }
         hr { margin: 14px 0; }
+        .capture-step { page-break-inside: avoid; margin: 0 0 20px 0; }
+        .capture-frame {
+          width: 100%;
+          min-height: 5.9in;
+          border: 1px solid #ccc;
+          padding: 8px;
+          box-sizing: border-box;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          overflow: hidden;
+        }
+        .capture-img {
+          display: block;
+          width: 100%;
+          max-height: 5.6in;
+          height: auto;
+          object-fit: contain;
+        }
       </style>
     </head>
     <body>
@@ -146,6 +183,190 @@ function buildDocHtml(report) {
     </body>
     </html>
   `;
+}
+
+function concatUint8Arrays(arrays) {
+  const total = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const arr of arrays) {
+    output.set(arr, offset);
+    offset += arr.length;
+  }
+  return output;
+}
+
+async function dataUrlToJpegImageData(dataUrl, quality = 0.9) {
+  const srcBlob = await fetch(dataUrl).then((r) => r.blob());
+  const bitmap = await createImageBitmap(srcBlob);
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Unable to prepare screenshot image for PDF.');
+  }
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, bitmap.width, bitmap.height);
+  ctx.drawImage(bitmap, 0, 0);
+  const jpegBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+  const jpegBuffer = await jpegBlob.arrayBuffer();
+  return {
+    width: bitmap.width,
+    height: bitmap.height,
+    bytes: new Uint8Array(jpegBuffer)
+  };
+}
+
+function makePdfStreamObjectBody(streamBytes, dictionaryLines) {
+  const encoder = new TextEncoder();
+  const header = encoder.encode(
+    `<<\n${dictionaryLines.join('\n')}\n/Length ${streamBytes.length}\n>>\nstream\n`
+  );
+  const footer = encoder.encode('\nendstream');
+  return concatUint8Arrays([header, streamBytes, footer]);
+}
+
+async function buildPdfBlob(report) {
+  const encoder = new TextEncoder();
+  const captures = Array.isArray(report.captures) ? report.captures : [];
+  if (!captures.length) {
+    throw new Error('No screenshots captured yet.');
+  }
+
+  const pageWidth = 842;
+  const pageHeight = 595;
+  const margin = 28;
+  const headerTop = 34;
+  const metaLineGap = 14;
+  const imageTop = 128;
+  const imageBottom = 28;
+  const imageAreaWidth = pageWidth - (margin * 2);
+  const imageAreaHeight = pageHeight - imageTop - imageBottom;
+
+  const prepared = [];
+  for (const capture of captures) {
+    prepared.push({
+      capture,
+      image: await dataUrlToJpegImageData(capture.imageDataUrl)
+    });
+  }
+
+  let objId = 3;
+  const objectPlan = prepared.map(() => {
+    const pageObjId = ++objId;
+    const contentObjId = ++objId;
+    const imageObjId = ++objId;
+    return { pageObjId, contentObjId, imageObjId };
+  });
+  const maxObjId = objId;
+
+  const parts = [encoder.encode('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n')];
+  const offsets = new Array(maxObjId + 1).fill(0);
+  let currentOffset = parts[0].length;
+
+  const appendBytes = (bytes) => {
+    parts.push(bytes);
+    currentOffset += bytes.length;
+  };
+
+  const appendObject = (id, body) => {
+    offsets[id] = currentOffset;
+    appendBytes(encoder.encode(`${id} 0 obj\n`));
+    appendBytes(body);
+    appendBytes(encoder.encode('\nendobj\n'));
+  };
+
+  const pageRefs = objectPlan.map((plan) => `${plan.pageObjId} 0 R`).join(' ');
+  appendObject(1, encoder.encode('<< /Type /Catalog /Pages 2 0 R >>'));
+  appendObject(2, encoder.encode(`<< /Type /Pages /Kids [ ${pageRefs} ] /Count ${prepared.length} >>`));
+  appendObject(3, encoder.encode('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'));
+
+  prepared.forEach((item, index) => {
+    const { capture, image } = item;
+    const { pageObjId, contentObjId, imageObjId } = objectPlan[index];
+    const imageName = `Im${index + 1}`;
+    const scale = Math.min(imageAreaWidth / image.width, imageAreaHeight / image.height);
+    const drawWidth = image.width * scale;
+    const drawHeight = image.height * scale;
+    const drawX = (pageWidth - drawWidth) / 2;
+    const drawY = imageBottom + ((imageAreaHeight - drawHeight) / 2);
+    const timeText = new Date(capture.ts).toLocaleString();
+    const stepTitle = `ClickSnap Evidence Report - Step ${index + 1} of ${prepared.length}`;
+
+    const contentText = [
+      'BT',
+      '/F1 16 Tf',
+      `${margin} ${pageHeight - headerTop} Td`,
+      `(${escapePdfText(stepTitle)}) Tj`,
+      'ET',
+      'BT',
+      '/F1 10 Tf',
+      `${margin} ${pageHeight - (headerTop + metaLineGap + 8)} Td`,
+      `(${escapePdfText(`Time: ${timeText}`)}) Tj`,
+      'ET',
+      'BT',
+      '/F1 10 Tf',
+      `${margin} ${pageHeight - (headerTop + (metaLineGap * 2) + 8)} Td`,
+      `(${escapePdfText(`Area: ${truncateText(capture.area || '-')}`)}) Tj`,
+      'ET',
+      'BT',
+      '/F1 10 Tf',
+      `${margin} ${pageHeight - (headerTop + (metaLineGap * 3) + 8)} Td`,
+      `(${escapePdfText(`Tag: ${truncateText(capture.tag || '-')}`)}) Tj`,
+      'ET',
+      'BT',
+      '/F1 10 Tf',
+      `${margin} ${pageHeight - (headerTop + (metaLineGap * 4) + 8)} Td`,
+      `(${escapePdfText(`URL: ${truncateText(capture.url || '-')}`)}) Tj`,
+      'ET',
+      'BT',
+      '/F1 10 Tf',
+      `${margin} ${pageHeight - (headerTop + (metaLineGap * 5) + 8)} Td`,
+      `(${escapePdfText(`Note: ${truncateText(capture.note || '-')}`)}) Tj`,
+      'ET',
+      'q',
+      `${drawWidth.toFixed(3)} 0 0 ${drawHeight.toFixed(3)} ${drawX.toFixed(3)} ${drawY.toFixed(3)} cm`,
+      `/${imageName} Do`,
+      'Q'
+    ].join('\n');
+
+    const contentBytes = encoder.encode(contentText);
+    const contentBody = makePdfStreamObjectBody(contentBytes, []);
+    appendObject(contentObjId, contentBody);
+
+    const imageBody = makePdfStreamObjectBody(
+      image.bytes,
+      [
+        '/Type /XObject',
+        '/Subtype /Image',
+        `/Width ${image.width}`,
+        `/Height ${image.height}`,
+        '/ColorSpace /DeviceRGB',
+        '/BitsPerComponent 8',
+        '/Filter /DCTDecode'
+      ]
+    );
+    appendObject(imageObjId, imageBody);
+
+    const pageBody = encoder.encode(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 3 0 R >> /XObject << /${imageName} ${imageObjId} 0 R >> >> /Contents ${contentObjId} 0 R >>`
+    );
+    appendObject(pageObjId, pageBody);
+  });
+
+  const xrefStart = currentOffset;
+  const xrefLines = ['xref', `0 ${maxObjId + 1}`, '0000000000 65535 f '];
+  for (let i = 1; i <= maxObjId; i += 1) {
+    xrefLines.push(`${String(offsets[i]).padStart(10, '0')} 00000 n `);
+  }
+  appendBytes(encoder.encode(`${xrefLines.join('\n')}\n`));
+  appendBytes(
+    encoder.encode(
+      `trailer\n<< /Size ${maxObjId + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`
+    )
+  );
+
+  return new Blob([concatUint8Arrays(parts)], { type: 'application/pdf' });
 }
 
 async function captureClick(tabId, payload) {
@@ -558,6 +779,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     };
 
     reader.readAsDataURL(blob);
+    return true;
+  }
+
+  if (message?.type === 'panel:exportPdf' && typeof tabId === 'number') {
+    const session = getSession(tabId);
+    const fallbackCaptures = Array.isArray(message.captures) ? message.captures : [];
+    const capturesForExport = session.captures.length ? session.captures : fallbackCaptures;
+    const fallbackMetadata = sanitizeMetadata(message.metadata);
+    const sessionMetadata = sanitizeMetadata(session.metadata);
+    const metadataForExport = Object.values(sessionMetadata).some((v) => String(v || '').trim().length > 0)
+      ? sessionMetadata
+      : fallbackMetadata;
+
+    if (!capturesForExport.length) {
+      sendResponse({ ok: false, error: 'No screenshots captured yet.' });
+      return true;
+    }
+
+    const report = {
+      pageUrl: message.pageUrl || '',
+      startedAt: session.startedAt || message.startedAt || Date.now(),
+      stoppedAt: session.stoppedAt || Date.now(),
+      metadata: metadataForExport,
+      captures: capturesForExport
+    };
+
+    (async () => {
+      try {
+        const pdfBlob = await buildPdfBlob(report);
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          await chrome.downloads.download({
+            url: reader.result,
+            filename: `clicksnap-report-${Date.now()}.pdf`,
+            saveAs: true
+          });
+          sendResponse({ ok: true });
+        };
+        reader.readAsDataURL(pdfBlob);
+      } catch (e) {
+        sendResponse({ ok: false, error: `PDF export failed: ${String(e?.message || e)}` });
+      }
+    })();
+
     return true;
   }
 
