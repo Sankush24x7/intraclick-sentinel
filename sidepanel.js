@@ -4,9 +4,11 @@ const ui = {
   stop: document.getElementById('stopBtn'),
   exportBtn: document.getElementById('exportBtn'),
   exportPdfBtn: document.getElementById('exportPdfBtn'),
+  exportZipBtn: document.getElementById('exportZipBtn'),
   clearBtn: document.getElementById('clearBtn'),
   closeBtn: document.getElementById('closeBtn'),
   previousBtn: document.getElementById('previousBtn'),
+  fullPageToggle: document.getElementById('fullPageToggle'),
   toggleSessionBtn: document.getElementById('toggleSessionBtn'),
   sessionMetaBody: document.getElementById('sessionMetaBody'),
   testerInput: document.getElementById('testerInput'),
@@ -39,7 +41,8 @@ const state = {
   },
   allowClose: false,
   sessionExpanded: false,
-  modalOpen: false
+  modalOpen: false,
+  fullPageCapture: false
 };
 
 let panelPort = null;
@@ -63,6 +66,7 @@ function renderControls() {
   ui.stop.disabled = !state.recording;
   ui.exportBtn.disabled = state.captures.length === 0;
   ui.exportPdfBtn.disabled = state.captures.length === 0;
+  ui.exportZipBtn.disabled = state.captures.length === 0;
   ui.clearBtn.disabled = state.captures.length === 0;
   ui.previousBtn.disabled = state.captures.length === 0;
 
@@ -132,6 +136,10 @@ function renderMetadata() {
   ui.ticketInput.value = state.metadata.ticketId || '';
   ui.envInput.value = state.metadata.environment || '';
   ui.buildInput.value = state.metadata.buildVersion || '';
+}
+
+function renderCaptureOptions() {
+  ui.fullPageToggle.checked = Boolean(state.fullPageCapture);
 }
 
 function buildCaptureCard(cap, stepNo, withNoteEditor) {
@@ -312,6 +320,7 @@ async function loadState() {
     state.startedAt = res.startedAt || null;
     state.captures = Array.isArray(res.captures) ? res.captures : [];
     state.metadata = Object.assign({}, state.metadata, res.metadata || {});
+    state.fullPageCapture = Boolean(res.fullPageCapture);
   }
 
   if (panelPort) {
@@ -329,6 +338,7 @@ async function loadState() {
 
   renderSessionToggle();
   renderMetadata();
+  renderCaptureOptions();
   renderControls();
   renderGallery();
   ensureTimerRunning();
@@ -338,7 +348,11 @@ async function startRecording() {
   showError('');
   await saveMetadata().catch(() => null);
 
-  const res = await chrome.runtime.sendMessage({ type: 'panel:start', tabId: state.tabId });
+  const res = await chrome.runtime.sendMessage({
+    type: 'panel:start',
+    tabId: state.tabId,
+    fullPageCapture: state.fullPageCapture
+  });
   if (!res?.ok) {
     showError(res?.error || 'Could not start recording. Refresh page once and retry.');
     return;
@@ -350,6 +364,25 @@ async function startRecording() {
   renderControls();
   renderGallery();
   ensureTimerRunning();
+}
+
+async function updateCaptureMode() {
+  showError('');
+  state.fullPageCapture = Boolean(ui.fullPageToggle.checked);
+  if (!state.tabId) return;
+  const res = await chrome.runtime.sendMessage({
+    type: 'panel:setCaptureMode',
+    tabId: state.tabId,
+    fullPageCapture: state.fullPageCapture
+  });
+  if (!res?.ok) {
+    showError(res?.error || 'Failed to update capture mode.');
+    state.fullPageCapture = !state.fullPageCapture;
+    ui.fullPageToggle.checked = state.fullPageCapture;
+    return;
+  }
+  state.fullPageCapture = Boolean(res.fullPageCapture);
+  ui.fullPageToggle.checked = state.fullPageCapture;
 }
 
 async function pauseResumeRecording() {
@@ -393,6 +426,10 @@ async function exportWord() {
 
 async function exportPdf() {
   await exportReport('panel:exportPdf', 'PDF export failed.');
+}
+
+async function exportZip() {
+  await exportReport('panel:exportZip', 'ZIP export failed.');
 }
 
 async function exportReport(messageType, errorText) {
@@ -527,9 +564,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   ui.stop.addEventListener('click', stopRecording);
   ui.exportBtn.addEventListener('click', exportWord);
   ui.exportPdfBtn.addEventListener('click', exportPdf);
+  ui.exportZipBtn.addEventListener('click', exportZip);
   ui.clearBtn.addEventListener('click', clearCaptures);
   ui.closeBtn.addEventListener('click', closePanel);
   ui.previousBtn.addEventListener('click', openHistoryModal);
+  ui.fullPageToggle.addEventListener('change', updateCaptureMode);
   ui.toggleSessionBtn.addEventListener('click', toggleSessionDetails);
   ui.modalCloseBtn.addEventListener('click', closeHistoryModal);
   ui.historyModal.addEventListener('click', (e) => {

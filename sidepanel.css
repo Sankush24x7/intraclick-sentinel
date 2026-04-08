@@ -139,6 +139,26 @@ header p {
   gap: 8px;
 }
 
+.capture-options {
+  margin-top: 8px;
+  margin-bottom: 2px;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #0f172a;
+  user-select: none;
+}
+
+.toggle-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #0f766e;
+}
+
 button {
   border: 1px solid transparent;
   border-radius: 10px;

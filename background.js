@@ -54,7 +54,8 @@ function getSession(tabId) {
       queue: [],
       processing: false,
       lastCaptureTs: 0,
-      linkedTabIds: new Set()
+      linkedTabIds: new Set(),
+      fullPageCapture: false
     });
   }
   return sessions.get(tabId);
@@ -183,6 +184,228 @@ function buildDocHtml(report) {
     </body>
     </html>
   `;
+}
+
+function buildReportForExport(session, message) {
+  const fallbackCaptures = Array.isArray(message?.captures) ? message.captures : [];
+  const capturesForExport = session.captures.length ? session.captures : fallbackCaptures;
+  const fallbackMetadata = sanitizeMetadata(message?.metadata);
+  const sessionMetadata = sanitizeMetadata(session.metadata);
+  const metadataForExport = Object.values(sessionMetadata).some((v) => String(v || '').trim().length > 0)
+    ? sessionMetadata
+    : fallbackMetadata;
+  const report = {
+    pageUrl: message?.pageUrl || '',
+    startedAt: session.startedAt || message?.startedAt || Date.now(),
+    stoppedAt: session.stoppedAt || Date.now(),
+    metadata: metadataForExport,
+    captures: capturesForExport
+  };
+  return report;
+}
+
+function uint32ToLittleEndian(value) {
+  return new Uint8Array([
+    value & 0xff,
+    (value >>> 8) & 0xff,
+    (value >>> 16) & 0xff,
+    (value >>> 24) & 0xff
+  ]);
+}
+
+function uint16ToLittleEndian(value) {
+  return new Uint8Array([
+    value & 0xff,
+    (value >>> 8) & 0xff
+  ]);
+}
+
+function dosDateTime(ts) {
+  const date = new Date(ts || Date.now());
+  const year = Math.max(1980, date.getFullYear());
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const hours = date.getHours();
+  const mins = date.getMinutes();
+  const secs = Math.floor(date.getSeconds() / 2);
+  const dosTime = (hours << 11) | (mins << 5) | secs;
+  const dosDate = ((year - 1980) << 9) | (month << 5) | day;
+  return { dosTime, dosDate };
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) {
+    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dataUrlToBytes(dataUrl) {
+  const raw = String(dataUrl || '');
+  const commaIdx = raw.indexOf(',');
+  if (commaIdx === -1) {
+    throw new Error('Invalid image data URL.');
+  }
+  const b64 = raw.slice(commaIdx + 1);
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function buildZipBlob(entries) {
+  const encoder = new TextEncoder();
+  const chunks = [];
+  const centralDirChunks = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const fileBytes = entry.bytes;
+    const csum = crc32(fileBytes);
+    const { dosTime, dosDate } = dosDateTime(entry.ts);
+
+    const localHeader = concatUint8Arrays([
+      uint32ToLittleEndian(0x04034b50),
+      uint16ToLittleEndian(20),
+      uint16ToLittleEndian(0),
+      uint16ToLittleEndian(0),
+      uint16ToLittleEndian(dosTime),
+      uint16ToLittleEndian(dosDate),
+      uint32ToLittleEndian(csum),
+      uint32ToLittleEndian(fileBytes.length),
+      uint32ToLittleEndian(fileBytes.length),
+      uint16ToLittleEndian(nameBytes.length),
+      uint16ToLittleEndian(0),
+      nameBytes,
+      fileBytes
+    ]);
+    chunks.push(localHeader);
+
+    const centralHeader = concatUint8Arrays([
+      uint32ToLittleEndian(0x02014b50),
+      uint16ToLittleEndian(20),
+      uint16ToLittleEndian(20),
+      uint16ToLittleEndian(0),
+      uint16ToLittleEndian(0),
+      uint16ToLittleEndian(dosTime),
+      uint16ToLittleEndian(dosDate),
+      uint32ToLittleEndian(csum),
+      uint32ToLittleEndian(fileBytes.length),
+      uint32ToLittleEndian(fileBytes.length),
+      uint16ToLittleEndian(nameBytes.length),
+      uint16ToLittleEndian(0),
+      uint16ToLittleEndian(0),
+      uint16ToLittleEndian(0),
+      uint16ToLittleEndian(0),
+      uint32ToLittleEndian(0),
+      uint32ToLittleEndian(offset),
+      nameBytes
+    ]);
+    centralDirChunks.push(centralHeader);
+    offset += localHeader.length;
+  }
+
+  const centralDir = concatUint8Arrays(centralDirChunks);
+  const eocd = concatUint8Arrays([
+    uint32ToLittleEndian(0x06054b50),
+    uint16ToLittleEndian(0),
+    uint16ToLittleEndian(0),
+    uint16ToLittleEndian(entries.length),
+    uint16ToLittleEndian(entries.length),
+    uint32ToLittleEndian(centralDir.length),
+    uint32ToLittleEndian(offset),
+    uint16ToLittleEndian(0)
+  ]);
+
+  return new Blob([concatUint8Arrays([...chunks, centralDir, eocd])], { type: 'application/zip' });
+}
+
+async function blobToBytes(blob) {
+  const buffer = await blob.arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
+async function buildZipExportBlob(report) {
+  const encoder = new TextEncoder();
+  const timestamp = Date.now();
+  const safeStamp = new Date(timestamp).toISOString().replace(/[:.]/g, '-');
+  const root = `clicksnap-report-${safeStamp}`;
+
+  const docHtml = buildDocHtml(report);
+  const docBytes = encoder.encode(docHtml);
+  const pdfBlob = await buildPdfBlob(report);
+  const pdfBytes = await blobToBytes(pdfBlob);
+
+  const screenshotEntries = [];
+  const captureLog = [];
+  report.captures.forEach((capture, idx) => {
+    const step = String(idx + 1).padStart(3, '0');
+    const filename = `screenshots/step-${step}.png`;
+    screenshotEntries.push({
+      name: `${root}/${filename}`,
+      bytes: dataUrlToBytes(capture.imageDataUrl),
+      ts: capture.ts
+    });
+    captureLog.push({
+      step: idx + 1,
+      id: capture.id,
+      ts: capture.ts,
+      time: new Date(capture.ts).toLocaleString(),
+      url: capture.url || '',
+      area: capture.area || '-',
+      tag: capture.tag || '-',
+      note: capture.note || '-',
+      file: filename
+    });
+  });
+
+  const reportJson = {
+    generatedAt: timestamp,
+    generatedAtIso: new Date(timestamp).toISOString(),
+    pageUrl: report.pageUrl || '',
+    startedAt: report.startedAt || timestamp,
+    stoppedAt: report.stoppedAt || timestamp,
+    metadata: report.metadata || {},
+    totalCaptures: report.captures.length,
+    captures: captureLog
+  };
+
+  const zipEntries = [
+    {
+      name: `${root}/report.doc`,
+      bytes: docBytes,
+      ts: timestamp
+    },
+    {
+      name: `${root}/report.pdf`,
+      bytes: pdfBytes,
+      ts: timestamp
+    },
+    {
+      name: `${root}/captures.json`,
+      bytes: encoder.encode(JSON.stringify(reportJson, null, 2)),
+      ts: timestamp
+    },
+    ...screenshotEntries
+  ];
+
+  return buildZipBlob(zipEntries);
 }
 
 function concatUint8Arrays(arrays) {
@@ -532,6 +755,130 @@ async function captureWithRetry(windowId, retries = 2) {
   return null;
 }
 
+async function runScriptOnTab(tabId, func, args = []) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func,
+    args
+  });
+  return results?.[0]?.result;
+}
+
+function buildScrollSteps(total, viewport) {
+  if (!Number.isFinite(total) || !Number.isFinite(viewport) || total <= 0 || viewport <= 0) return [0];
+  if (total <= viewport) return [0];
+  const max = total - viewport;
+  const steps = [];
+  for (let pos = 0; pos <= max; pos += viewport) {
+    steps.push(Math.round(pos));
+  }
+  if (steps[steps.length - 1] !== Math.round(max)) {
+    steps.push(Math.round(max));
+  }
+  return steps;
+}
+
+async function getPageCaptureMetrics(tabId) {
+  return runScriptOnTab(
+    tabId,
+    () => {
+      const doc = document.documentElement;
+      const body = document.body;
+      const scrollWidth = Math.max(
+        doc?.scrollWidth || 0,
+        body?.scrollWidth || 0,
+        doc?.clientWidth || 0,
+        window.innerWidth || 0
+      );
+      const scrollHeight = Math.max(
+        doc?.scrollHeight || 0,
+        body?.scrollHeight || 0,
+        doc?.clientHeight || 0,
+        window.innerHeight || 0
+      );
+      return {
+        scrollWidth,
+        scrollHeight,
+        viewportWidth: window.innerWidth || doc?.clientWidth || 0,
+        viewportHeight: window.innerHeight || doc?.clientHeight || 0,
+        dpr: window.devicePixelRatio || 1,
+        scrollX: window.scrollX || window.pageXOffset || 0,
+        scrollY: window.scrollY || window.pageYOffset || 0
+      };
+    }
+  );
+}
+
+async function scrollToPosition(tabId, x, y) {
+  return runScriptOnTab(
+    tabId,
+    (nx, ny) => {
+      window.scrollTo(nx, ny);
+      return {
+        x: window.scrollX || window.pageXOffset || 0,
+        y: window.scrollY || window.pageYOffset || 0
+      };
+    },
+    [x, y]
+  );
+}
+
+async function captureFullPageWithStitch(tabId, windowId) {
+  const metrics = await getPageCaptureMetrics(tabId);
+  if (!metrics || !metrics.viewportWidth || !metrics.viewportHeight) {
+    throw new Error('Unable to read page dimensions for full-page capture.');
+  }
+
+  const dpr = Math.max(1, Number(metrics.dpr) || 1);
+  const totalWidthPx = Math.max(1, Math.round(metrics.scrollWidth * dpr));
+  const totalHeightPx = Math.max(1, Math.round(metrics.scrollHeight * dpr));
+  const MAX_DIMENSION = 16384;
+  if (totalWidthPx > MAX_DIMENSION || totalHeightPx > MAX_DIMENSION) {
+    throw new Error('Page too large for full-page capture. Try visible mode.');
+  }
+
+  const canvas = new OffscreenCanvas(totalWidthPx, totalHeightPx);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Unable to create full-page capture canvas.');
+  }
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, totalWidthPx, totalHeightPx);
+
+  const xSteps = buildScrollSteps(metrics.scrollWidth, metrics.viewportWidth);
+  const ySteps = buildScrollSteps(metrics.scrollHeight, metrics.viewportHeight);
+  const originalX = Math.max(0, Math.round(metrics.scrollX || 0));
+  const originalY = Math.max(0, Math.round(metrics.scrollY || 0));
+
+  try {
+    for (const y of ySteps) {
+      for (const x of xSteps) {
+        const current = await scrollToPosition(tabId, x, y);
+        await wait(130);
+        const tileUrl = await captureWithRetry(windowId, 4);
+        const tileBlob = await fetch(tileUrl).then((r) => r.blob());
+        const tileBitmap = await createImageBitmap(tileBlob);
+        const dx = Math.max(0, Math.round((current?.x || x) * dpr));
+        const dy = Math.max(0, Math.round((current?.y || y) * dpr));
+        const drawW = Math.min(tileBitmap.width, totalWidthPx - dx);
+        const drawH = Math.min(tileBitmap.height, totalHeightPx - dy);
+        if (drawW > 0 && drawH > 0) {
+          ctx.drawImage(tileBitmap, 0, 0, drawW, drawH, dx, dy, drawW, drawH);
+        }
+      }
+    }
+  } finally {
+    await scrollToPosition(tabId, originalX, originalY).catch(() => {});
+  }
+
+  const mergedBlob = await canvas.convertToBlob({ type: 'image/png' });
+  const mergedDataUrl = await blobToDataUrl(mergedBlob);
+  if (typeof mergedDataUrl !== 'string') {
+    throw new Error('Failed to build full-page screenshot.');
+  }
+  return mergedDataUrl;
+}
+
 async function processCaptureQueue(ownerTabId) {
   const session = getSession(ownerTabId);
   if (session.processing) return;
@@ -551,7 +898,11 @@ async function processCaptureQueue(ownerTabId) {
         await wait(550 - gap);
       }
 
-      dataUrl = await captureWithRetry(tab.windowId, 4);
+      if (session.fullPageCapture) {
+        dataUrl = await captureFullPageWithStitch(sourceTabId, tab.windowId);
+      } else {
+        dataUrl = await captureWithRetry(tab.windowId, 4);
+      }
       dataUrl = await applySensitiveRedaction(dataUrl, payload.sensitiveRects || []);
       dataUrl = await addWatermarkToImage(dataUrl, WATERMARK_TEXT);
       session.lastCaptureTs = Date.now();
@@ -648,7 +999,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       startedAt: session.startedAt,
       stoppedAt: session.stoppedAt,
       metadata: session.metadata,
-      captures: session.captures
+      captures: session.captures,
+      fullPageCapture: Boolean(session.fullPageCapture)
     });
     return true;
   }
@@ -671,6 +1023,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     target.note = note;
     sendResponse({ ok: true, captures: session.captures });
+    return true;
+  }
+
+  if (message?.type === 'panel:setCaptureMode' && typeof tabId === 'number') {
+    const session = getSession(tabId);
+    session.fullPageCapture = Boolean(message.fullPageCapture);
+    sendResponse({ ok: true, fullPageCapture: session.fullPageCapture });
     return true;
   }
 
@@ -700,9 +1059,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       session.processing = false;
       session.lastCaptureTs = 0;
       session.linkedTabIds = new Set([tabId]);
+      session.fullPageCapture = Boolean(message.fullPageCapture);
 
       await sendStartToTab(tabId);
-      sendResponse({ ok: true, startedAt: session.startedAt });
+      sendResponse({
+        ok: true,
+        startedAt: session.startedAt,
+        fullPageCapture: session.fullPageCapture
+      });
     })();
     return true;
   }
@@ -744,26 +1108,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'panel:exportWord' && typeof tabId === 'number') {
     const session = getSession(tabId);
-    const fallbackCaptures = Array.isArray(message.captures) ? message.captures : [];
-    const capturesForExport = session.captures.length ? session.captures : fallbackCaptures;
-    const fallbackMetadata = sanitizeMetadata(message.metadata);
-    const sessionMetadata = sanitizeMetadata(session.metadata);
-    const metadataForExport = Object.values(sessionMetadata).some((v) => String(v || '').trim().length > 0)
-      ? sessionMetadata
-      : fallbackMetadata;
-
-    if (!capturesForExport.length) {
+    const report = buildReportForExport(session, message);
+    if (!report.captures.length) {
       sendResponse({ ok: false, error: 'No screenshots captured yet.' });
       return true;
     }
-
-    const report = {
-      pageUrl: message.pageUrl || '',
-      startedAt: session.startedAt || message.startedAt || Date.now(),
-      stoppedAt: session.stoppedAt || Date.now(),
-      metadata: metadataForExport,
-      captures: capturesForExport
-    };
 
     const html = buildDocHtml(report);
     const blob = new Blob([html], { type: 'application/msword' });
@@ -784,26 +1133,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'panel:exportPdf' && typeof tabId === 'number') {
     const session = getSession(tabId);
-    const fallbackCaptures = Array.isArray(message.captures) ? message.captures : [];
-    const capturesForExport = session.captures.length ? session.captures : fallbackCaptures;
-    const fallbackMetadata = sanitizeMetadata(message.metadata);
-    const sessionMetadata = sanitizeMetadata(session.metadata);
-    const metadataForExport = Object.values(sessionMetadata).some((v) => String(v || '').trim().length > 0)
-      ? sessionMetadata
-      : fallbackMetadata;
-
-    if (!capturesForExport.length) {
+    const report = buildReportForExport(session, message);
+    if (!report.captures.length) {
       sendResponse({ ok: false, error: 'No screenshots captured yet.' });
       return true;
     }
-
-    const report = {
-      pageUrl: message.pageUrl || '',
-      startedAt: session.startedAt || message.startedAt || Date.now(),
-      stoppedAt: session.stoppedAt || Date.now(),
-      metadata: metadataForExport,
-      captures: capturesForExport
-    };
 
     (async () => {
       try {
@@ -820,6 +1154,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         reader.readAsDataURL(pdfBlob);
       } catch (e) {
         sendResponse({ ok: false, error: `PDF export failed: ${String(e?.message || e)}` });
+      }
+    })();
+
+    return true;
+  }
+
+  if (message?.type === 'panel:exportZip' && typeof tabId === 'number') {
+    const session = getSession(tabId);
+    const report = buildReportForExport(session, message);
+    if (!report.captures.length) {
+      sendResponse({ ok: false, error: 'No screenshots captured yet.' });
+      return true;
+    }
+
+    (async () => {
+      try {
+        const zipBlob = await buildZipExportBlob(report);
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          await chrome.downloads.download({
+            url: reader.result,
+            filename: `clicksnap-report-${Date.now()}.zip`,
+            saveAs: true
+          });
+          sendResponse({ ok: true });
+        };
+        reader.readAsDataURL(zipBlob);
+      } catch (e) {
+        sendResponse({ ok: false, error: `ZIP export failed: ${String(e?.message || e)}` });
       }
     })();
 
